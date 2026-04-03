@@ -1,683 +1,567 @@
-# -*- coding: utf-8 -*-
-import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+"""
+CORTIGOCAMPATI — ESP32 VIGNETO FIRMWARE
+main.py — MicroPython v2.x
+Sensori: DHT22 · HTU21 · BH1750 · BMP180x2 · Soil ADC
+Invio:   HTTPS GET -> receiver.cgi
+Stabilita':
+  - Deep sleep tra le misure (~10uA vs ~50mA idle)
+  - WDT hardware 90s (>WiFi timeout totale)
+  - feed_wdt() dentro il loop di attesa WiFi
+  - IP statico reimpostato ad ogni tentativo
+  - Rilevamento cold boot vs wake-from-deepsleep
+  - Warm-up DHT22 (2s) solo al cold boot
+  - I2C scan solo al cold boot
+  - Retry DHT22 (3 tentativi)
+  - Tutti i sensori opzionali (payload = 0 se fail)
+  - Validazione range su ogni lettura
+Alessandro Cescon — 2025
+"""
 
-import zipfile
-import ghostscript
-import shutil
-import os
-import re
-import requests
-import threading
-import tkinter as tk
-from tkinter import filedialog
+import time
+import math
+import network
+import machine
+from machine import Pin, I2C, ADC, WDT, reset_cause, DEEPSLEEP_RESET
+import dht
 
-from reportlab.lib.units import mm
-from reportlab.pdfgen.canvas import Canvas
-from reportlab.lib.pagesizes import A4, landscape
-from pdfrw import PdfReader
-from pdfrw.buildxobj import pagexobj
-from pdfrw.toreportlab import makerl
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.lib.enums import TA_CENTER, TA_RIGHT, TA_LEFT, TA_JUSTIFY
-from reportlab.platypus import Paragraph
-from reportlab.platypus.tables import Table, TableStyle
-import PyPDF2
-from Crypto.Cipher import AES
-import base64
+try:
+    import urequests as requests
+except ImportError:
+    import requests
 
-# --- CONFIGURAZIONI DEFAULT ---
-# AES-256-ECB, chiave 32 byte (PHP tronca silenziosamente i 64 char della stringa)
-_KEY = b'McQfTjWnZr4u7x!a%D*G-KaPdRgUkXp2'
-default_priceslevel = "pricelistbuilder"
-default_vo = "400"
-default_fr = "50"
-default_language = "en"
-default_brand = "visa"
-default_name = "109000000211-001-17"
-default_template = "public"
-default_pricetemplate = "gross"
-default_folder = "C:\\Users\\acescon\\Desktop\\LISTINO_2026\\LISTINO_2026_04\\50HZ_400V_GROSS_EN"
-default_ph = 'field_gen_fas/3fn/field_gen_fas/3f/'
-default_ph_val = '3'
+# ============================================================
+#  BOOT TYPE
+# ============================================================
+COLD_BOOT = (reset_cause() != DEEPSLEEP_RESET)
 
-# --- DATI GLOBALI ---
-cookie_session = None
-datadomain = "https://quote.visa.it"
-extraparams = 'dopdf=1&action=bypass'
-indexfiles = ""
-indexfile_path = ""
+# ============================================================
+#  CPU FREQUENCY
+# ============================================================
+machine.freq(240000000)
 
-priceslevel = default_priceslevel
-vo = default_vo
-fr = default_fr
-language = default_language
-brand = default_brand
-template = default_template
-pricetemplate = default_pricetemplate
-distlink = "https://quote.visa.it/" + language + "/price-list-distiller&action=bypass"
-savefolder = ''
-finalname = ''
-finalfilename = ''
-finalfilenamepages = ''
-phases = default_ph
-ph = default_ph_val
+# ============================================================
+#  WATCHDOG
+#  DEVE essere > WIFI_TIMEOUT_S * WIFI_RETRY_N
+#  20s * 3 retry = 60s + margine = 90s
+# ============================================================
+WDT_ENABLE  = True
+WDT_TIMEOUT = 90000   # ms — era 60000, troppo poco per 3 retry da 30s
 
-alts = 'field_gen_alt_mod/s0l1h/field_gen_alt_mod/s0l1p/field_gen_alt_mod/s0l2g/field_gen_alt_mod/s0l2p/field_gen_alt_mod/s1l2k/field_gen_alt_mod/s1l2n/field_gen_alt_mod/s1l2y/field_gen_alt_mod/uci224g/field_gen_alt_mod/uci274c/field_gen_alt_mod/uci274e/field_gen_alt_mod/uci274f/field_gen_alt_mod/uci274g/field_gen_alt_mod/uci274h/field_gen_alt_mod/uci224e/field_gen_alt_mod/s0l1l/field_gen_alt_mod/s0l2m/field_gen_alt_mod/s4l1dd/field_gen_alt_mod/s4l1s/field_gen_alt_mod/s4l1sd/field_gen_alt_mod/ucdi274k/field_gen_alt_mod/s4l1de/field_gen_alt_mod/s4l1dg/field_gen_alt_mod/hci5f/field_gen_alt_mod/hci5c/field_gen_alt_mod/hci5d/field_gen_alt_mod/s4l1df/field_gen_alt_mod/s6l1dc/field_gen_alt_mod/s6l1dd/field_gen_alt_mod/pi734a/field_gen_alt_mod/pi734c/field_gen_alt_mod/pi734e/field_gen_alt_mod/s6l1de/field_gen_alt_mod/pi734b/field_gen_alt_mod/pi734d/field_gen_alt_mod/pi734f/field_gen_alt_mod/pi734g/field_gen_alt_mod/eco46vl4a/field_gen_alt_mod/tal044d/field_gen_alt_mod/s7l1dc/field_gen_alt_mod/s7l1dd/field_gen_alt_mod/s7l1de/field_gen_alt_mod/s7l1df/field_gen_alt_mod/s7l1dg/field_gen_alt_mod/s7l1dh/field_gen_alt_mod/s7l1dj/field_gen_alt_mod/s6l1dg/field_gen_alt_mod/s5l1dc/field_gen_alt_mod/s5l1dd/field_gen_alt_mod/s5l1df/'
-
-pricelist_array = [
-    {"link": alts+'field_gen_rng/powerfull/field_gen_vrs/b/field_gen_mot_emi/n/field_gen_mot_emi/2/field_gen_mot_emi/5/field_gen_mot_brnd/perkins/', "range": "b", "engine": "perkins", "emiss": "n2"},
-    {"link": alts+'field_gen_rng/powerfull/field_gen_vrs/b/field_gen_mot_emi/n/field_gen_mot_emi/2/field_gen_mot_brnd/fptiveco/', "range": "b", "engine": "fptiveco", "emiss": "n2"},
-    {"link": alts+'field_gen_rng/powerfull/field_gen_vrs/b/field_gen_mot_brnd/fptiveco/field_gen_mot_emi/3', "range": "b", "engine": "fptiveco", "emiss": "3"},
-    {"link": alts+'field_gen_rng/powerfull/field_gen_vrs/b/field_gen_mot_emi/n/field_gen_mot_emi/2/field_gen_mot_brnd/baudouin', "range": "b", "engine": "baudouin", "emiss": "n2"},
-    {"link": alts+'field_gen_rng/powerfull/field_gen_vrs/b/field_gen_mot_emi/n/field_gen_mot_emi/2/field_gen_mot_brnd/doosan', "range": "b", "engine": "doosan", "emiss": "n2"},
-    {"link": alts+'field_gen_rng/powerfull/field_gen_vrs/b/field_gen_mot_emi/n/field_gen_mot_emi/2/field_gen_mot_brnd/volvopenta', "range": "b", "engine": "volvopenta", "emiss": "n2"},
-    {"link": alts+'field_gen_rng/powerfull/field_gen_vrs/b/field_gen_mot_emi/n/field_gen_mot_emi/2/field_gen_mot_brnd/scania', "range": "b", "engine": "scania", "emiss": "n2"},
-    {"link": alts+'field_gen_rng/powerfull/field_gen_vrs/b/field_gen_mot_emi/n/field_gen_mot_emi/2/field_gen_mot_emi/3/field_gen_mot_brnd/yuchai', "range": "b", "engine": "yuchai", "emiss": "n2"},
-    {"link": alts+'field_gen_rng/powerfull/field_gen_mot_emi/n/field_gen_mot_emi/2/field_gen_vrs/u/field_gen_mot_brnd/perkins', "range": "u", "engine": "perkins", "emiss": "n2"},
-    {"link": alts+'field_gen_rng/powerfull/field_gen_mot_emi/n/field_gen_mot_emi/2/field_gen_vrs/u/field_gen_mot_brnd/cummins', "range": "u", "engine": "cummins", "emiss": "n2"},
-    {"link": alts+'field_gen_rng/powerfull/field_gen_mot_emi/n/field_gen_mot_emi/2/field_gen_mot_emi/3/field_gen_vrs/u/field_gen_mot_brnd/yuchai', "range": "u", "engine": "yuchai", "emiss": "n2"},
-    {"link": alts+'field_gen_rng/powerfull/field_gen_mot_emi/n/field_gen_mot_emi/2/field_gen_vrs/u/field_gen_mot_brnd/mitsubishi', "range": "u", "engine": "mitsubishi", "emiss": "n2"},
-    {"link": alts+'field_gen_rng/powerfull/field_gen_mot_emi/n/field_gen_mot_emi/2/field_gen_vrs/u/field_gen_mot_brnd/baudouin', "range": "u", "engine": "baudouin", "emiss": "n2"},
-    {"link": alts+'field_gen_rng/fox/field_gen_rng/bigfox/field_gen_mot_emi/n/field_gen_mot_emi/2/field_gen_mot_brnd/perkins/field_gen_vrs/fox', "range": "fox", "engine": "perkins", "emiss": "n2"},
-    {"link": alts+'field_gen_rng/fox/field_gen_rng/bigfox/field_gen_mot_emi/n/field_gen_mot_emi/2/field_gen_mot_emi/3/field_gen_mot_brnd/fptiveco/field_gen_vrs/fox', "range": "fox", "engine": "fptiveco", "emiss": "n2"},
-    {"link": alts+'field_gen_rng/fox/field_gen_rng/bigfox/field_gen_mot_emi/n/field_gen_mot_emi/2/field_gen_mot_emi/3/field_gen_mot_brnd/yuchai/field_gen_vrs/fox', "range": "fox", "engine": "yuchai", "emiss": "n2"},
-    {"link": alts+'field_gen_rng/cricket/field_gen_mot_emi/n/field_gen_mot_emi/2/field_gen_mot_emi/5/field_gen_vrs/ck/field_gen_cof_mod/ck100100/field_gen_cof_mod/ck200200/field_gen_cof_mod/ck400000/field_gen_cof_mod/ck300000/field_gen_cof_mod/ck300100/field_gen_cof_mod/ck200100/field_gen_cof_mod/ck400000/field_gen_mot_brnd/perkins', "range": "ck", "engine": "perkins", "emiss": "n2"},
-    {"link": alts+'field_gen_rng/cricket/field_gen_mot_emi/n/field_gen_mot_emi/2/field_gen_vrs/ck/field_gen_cof_mod/ck100100/field_gen_cof_mod/ck200200/field_gen_cof_mod/ck400000/field_gen_cof_mod/ck300000/field_gen_cof_mod/ck300100/field_gen_cof_mod/ck200100/field_gen_cof_mod/ck400000/field_gen_mot_brnd/baudouin', "range": "ck", "engine": "baudouin", "emiss": "n2"},
-    {"link": alts+'field_gen_rng/cricket/field_gen_mot_emi/n/field_gen_mot_emi/2/field_gen_vrs/ck/field_gen_cof_mod/ck100100/field_gen_cof_mod/ck200200/field_gen_cof_mod/ck400000/field_gen_cof_mod/ck300000/field_gen_cof_mod/ck300100/field_gen_cof_mod/ck200100/field_gen_cof_mod/ck400000/field_gen_mot_brnd/fptiveco', "range": "ck", "engine": "fptiveco", "emiss": "n2"},
-    {"link": alts+'field_gen_rng/galaxy/field_gen_mot_emi/n/field_gen_mot_emi/2/field_gen_vrs/gx/field_gen_mot_brnd/perkins', "range": "gx", "engine": "perkins", "emiss": "n2"},
-    {"link": alts+'field_gen_rng/galaxy/field_gen_mot_emi/n/field_gen_mot_emi/2/field_gen_vrs/gx/field_gen_mot_brnd/fptiveco', "range": "gx", "engine": "fptiveco", "emiss": "n2"},
-    {"link": alts+'field_gen_rng/galaxy/field_gen_vrs/gx/field_gen_mot_brnd/fptiveco/field_gen_mot_emi/3', "range": "gx", "engine": "fptiveco", "emiss": "3"},
-    {"link": alts+'field_gen_rng/galaxy/field_gen_mot_emi/n/field_gen_mot_emi/2/field_gen_vrs/gx/field_gen_mot_brnd/baudouin', "range": "gx", "engine": "baudouin", "emiss": "2n"},
-    {"link": alts+'field_gen_rng/galaxy/field_gen_mot_emi/n/field_gen_mot_emi/2/field_gen_vrs/gx/field_gen_mot_brnd/volvopenta', "range": "gx", "engine": "volvopenta", "emiss": "2n"},
-    {"link": alts+'field_gen_rng/galaxy/field_gen_mot_emi/5/field_gen_vrs/gx/field_gen_mot_brnd/volvopenta', "range": "gx", "engine": "volvopenta", "emiss": "5"},
-    {"link": alts+'field_gen_rng/galaxy/field_gen_mot_emi/n/field_gen_mot_emi/2/field_gen_vrs/gx/field_gen_mot_brnd/doosan', "range": "gx", "engine": "doosan", "emiss": "2n"},
-    {"link": alts+'field_gen_rng/galaxy/field_gen_mot_emi/n/field_gen_mot_emi/2/field_gen_vrs/gx/field_gen_mot_brnd/scania', "range": "gx", "engine": "scania", "emiss": "2n"},
-    {"link": alts+'field_gen_rng/galaxy/field_gen_mot_emi/5/field_gen_vrs/gx/field_gen_mot_brnd/scania', "range": "gx", "engine": "scania", "emiss": "5"},
-    {"link": alts+'field_gen_rng/powerfull/field_gen_mot_emi/n/field_gen_mot_emi/2/field_gen_vrs/s/field_gen_mot_brnd/perkins', "range": "s", "engine": "perkins", "emiss": "2n"},
-    {"link": alts+'field_gen_rng/powerfull/field_gen_mot_emi/n/field_gen_mot_emi/2/field_gen_vrs/s/field_gen_mot_brnd/cummins', "range": "s", "engine": "cummins", "emiss": "2n"},
-    {"link": alts+'field_gen_rng/powerfull/field_gen_mot_emi/n/field_gen_mot_emi/2/field_gen_vrs/s/field_gen_mot_brnd/mitsubishi', "range": "s", "engine": "mitsubishi", "emiss": "2n"},
-    {"link": alts+'field_gen_rng/powerfull/field_gen_mot_emi/n/field_gen_mot_emi/2/field_gen_vrs/s/field_gen_mot_brnd/baudouin', "range": "s", "engine": "baudouin", "emiss": "2n"},
-    {"link": alts+'field_gen_rng/powerfull/field_gen_mot_emi/n/field_gen_mot_emi/2/field_gen_mot_emi/3/field_gen_vrs/s/field_gen_mot_brnd/yuchai', "range": "s", "engine": "yuchai", "emiss": "2n"},
-    {"link": alts+'field_gen_rng/fox/field_gen_rng/bigfox/field_gen_mot_emi/5/field_gen_vrs/fox/field_gen_mot_brnd/perkins', "range": "fox", "engine": "perkins", "emiss": "5"},
-    {"link": alts+'field_gen_rng/galaxy/field_gen_mot_emi/5/field_gen_vrs/gx/field_gen_mot_brnd/doosan', "range": "gx", "engine": "doosan", "emiss": "5"},
-    {"link": alts+'field_gen_rng/galaxy/field_gen_mot_emi/5/field_gen_vrs/gx/field_gen_mot_brnd/fptiveco', "range": "gx", "engine": "fptiveco", "emiss": "5"},
-    {"link": alts+'field_gen_rng/galaxy/field_gen_mot_emi/n/field_gen_mot_emi/2/field_gen_mot_emi/3/field_gen_vrs/gx/field_gen_mot_brnd/yuchai', "range": "gx", "engine": "yuchai", "emiss": "n2"}
+# ============================================================
+#  WIFI
+# ============================================================
+NETWORKS = [
+    ("tp_campagna",    "Gioelenicolo1",  "IP"),
+    ("ACWIFI",         "12345678",       "DHCP"),
+    ("acesconwifi24",  "LoveEyefly2016", "DHCP"),
 ]
+WIFI_TIMEOUT_S = 15   # era 30 — ridotto, 3 retry * 20s = 60s < WDT 90s
+WIFI_RETRY_N   = 2
 
-def _pkcs7_pad(data: bytes, block_size: int = 16) -> bytes:
-    pad_len = block_size - (len(data) % block_size)
-    return data + bytes([pad_len] * pad_len)
+# IP statici in rotazione — ogni tentativo usa un IP diverso
+# Tutti e 3 devono essere fuori dal pool DHCP del router
+STATIC_IPS  = ["192.168.1.87", "192.168.1.88", "192.168.1.89"]
+STATIC_MASK = "255.255.255.0"
+STATIC_GW   = "192.168.1.1"
+STATIC_DNS1 = "192.168.1.1"
+STATIC_DNS2 = "8.8.8.8"
 
-def make_token(path: str) -> str:
-    """
-    Riproduce openssl_encrypt($path, 'AES-256-ECB', $key) + double base64.
-    path : stringa già nella forma attesa dal server (es. '/fileserver/...' 
-           oppure '/' + filename per i doc esterni)
-    """
-    cipher = AES.new(_KEY, AES.MODE_ECB)
-    inner = base64.b64encode(cipher.encrypt(_pkcs7_pad(path.encode())))
-    return base64.b64encode(inner).decode()
+SERVER_URL   = "https://cortigocampati.ddns.net/cgi-bin/receiver.cgi?data="
+HTTP_TIMEOUT = 15
 
-# --- FUNZIONI LOGICA ---
+# ============================================================
+#  TIMING
+# ============================================================
+SLEEP_S      = 600
+DHT_RETRIES  = 3
+DHT_RETRY_MS = 2500
 
-def write_log(message):
-    log_text.config(state='normal')
-    log_text.insert('end', message + '\n')
-    log_text.see('end')
-    log_text.config(state='disabled')
+# ============================================================
+#  PINOUT
+# ============================================================
+I2C0_SDA = 21
+I2C0_SCL = 22
+I2C1_SDA = 18
+I2C1_SCL = 19
+DHT_PIN  = 4
+SOIL_PIN = 34
 
-def login():
-    global cookie_session
-    try:
-        csrf_response = requests.post("https://quote.visa.it/services/session/token", verify=False)
-        csrf_response.raise_for_status()
-        csrf_token = csrf_response.text
-    except Exception as e:
-        write_log(f"Errore CSRF: {e}")
-        return
+# ============================================================
+#  SOIL CALIBRATION
+# ============================================================
+SOIL_DRY      = 2530
+SOIL_WET      = 940
+SOIL_SAMPLES  = 8
+SOIL_DELAY_MS = 15
+SOIL_FLOAT    = 3900
 
-    headers = {"Accept": "application/json", "X-CSRF-Token": csrf_token}
-    data = {"name": "OnisVisaSpa", "pass": "LoveEyefly2016"}
-    try:
-        login_response = requests.post("https://quote.visa.it/rest/user/login", headers=headers, data=data, verify=False)
-        login_response.raise_for_status()
-        user_info = login_response.json()
-        cookie_session = f"{user_info['session_name']}={user_info['sessid']}"
-    except Exception as e:
-        write_log(f"Errore login: {e}")
+# ============================================================
+#  I2C ADDRESSES
+# ============================================================
+HTU21_ADDR  = 0x40
+BH1750_ADDR = 0x23
+BMP180_ADDR = 0x77
 
-def loadfile(url, lang):
-    global cookie_session, datadomain, priceslevel
-    full_url = f"{datadomain}/{lang}/{priceslevel}/{url}"
-    try:
-        response = requests.get(full_url, headers={"Cookie": cookie_session}, verify=False, timeout=120)
-        response.raise_for_status()
-        html = response.text
-        tables = ''
-        for table_id in ['pricelist2019', 'pricelist2019extra', 'pricelist2019extras5']:
-            match = re.search(rf"<table id='{table_id}'>(.*?)</table>", html, re.DOTALL)
-            if match:
-                tables += match.group(0)
-        return tables
-    except Exception as e:
-        write_log(f"Errore loadfile: {e}")
-        return ""
+# ============================================================
+#  DRIVER BH1750
+# ============================================================
+class BH1750:
+    CONT_HIRES = 0x10
 
-def buildpdf(htmltable, params):
-    global cookie_session, distlink, savefolder, fr, vo, phases
-    params['tabledata'] = htmltable
-    params['voltage'] = vo
-    params['frequency'] = fr
-    headers = {'Cookie': cookie_session}
-    try:
-        response = requests.post(distlink, data=params, headers=headers, verify=False, timeout=120)
-        fasi = phases.replace("field_gen_fas", "").replace("/", "")
-        if response.status_code == 200:
-            filename = os.path.join(savefolder, f"{params['range']}_{params['engine']}_{vo}_{fr}_{fasi}_{params['emiss']}.pdf")
-            write_log(filename)
-            with open(filename, 'wb') as f:
-                f.write(response.content)
-            write_log(f"PDF creato: {os.path.basename(filename)}")
-    except Exception as e:
-        write_log(f"Errore PDF: {e}")
+    def __init__(self, i2c, addr=BH1750_ADDR):
+        self.i2c  = i2c
+        self.addr = addr
+        self.ok   = False
 
-def buildxls(htmlstr, params):
-    global savefolder, fr, vo, phases
-    htmlstr = htmlstr.replace(".00 €", "")
-    htmlstr = re.sub(r'(?<=\d)\s+(?=\d)', '', htmlstr)
-    htmlstr = htmlstr.replace("é", "&eacute;").replace("è", "&egrave;").replace("á", "&aacute;") \
-                     .replace("à", "&agrave;").replace("ù", "&ugrave;").replace("ò", "&ograve;") \
-                     .replace("<th", "<th bgcolor='#FFBA01'").replace("<td", "<td align='center'")
-    fasi = phases.replace("field_gen_fas", "").replace("/", "")
-    filename = os.path.join(savefolder, "xls", f"{params['range']}_{params['engine']}_{vo}_{fr}_{fasi}_{params['emiss']}.xls")
-    write_log(filename)
-    with open(filename, 'w', encoding='utf-8') as f:
-        f.write(htmlstr)
+    def begin(self):
+        try:
+            self.i2c.writeto(self.addr, bytes([0x01]))
+            time.sleep_ms(10)
+            self.i2c.writeto(self.addr, bytes([self.CONT_HIRES]))
+            time.sleep_ms(180)
+            self.ok = True
+        except OSError as e:
+            print("[BH1750] begin error:", e)
+            self.ok = False
+        return self.ok
 
-def generate(item, extraparams, langu):
-    global brand, template, pricetemplate, savefolder, vo, fr, phases, ph, solo_excel_var
-    url = f"{phases}/{item['link']}/field_gen_freq/{fr}/field_gen_tens/{vo}?{extraparams}"
-    htmltable = loadfile(url, langu)
-    item.update({'language': langu, 'brand': brand, 'template': template, 'pricetemplate': pricetemplate,
-                 'voltage': vo, 'frequency': fr, 'phases': ph})
-    htmlstr = htmltable.replace("'", '"')
+    def read_lux(self):
+        if not self.ok:
+            return None
+        try:
+            data = self.i2c.readfrom(self.addr, 2)
+            raw  = (data[0] << 8) | data[1]
+            lux  = raw / 1.2
+            return lux if 0 <= lux <= 100000 else None
+        except OSError as e:
+            print("[BH1750] read error:", e)
+            return None
 
-    if not solo_excel_var.get():
-        buildpdf(htmlstr, item)
+# ============================================================
+#  DRIVER HTU21D
+# ============================================================
+class HTU21:
+    CMD_TEMP  = 0xE3
+    CMD_HUM   = 0xE5
+    CMD_RESET = 0xFE
 
-    buildxls(htmlstr, item)
+    def __init__(self, i2c, addr=HTU21_ADDR):
+        self.i2c  = i2c
+        self.addr = addr
+        self.ok   = False
 
+    def begin(self):
+        try:
+            self.i2c.writeto(self.addr, bytes([self.CMD_RESET]))
+            time.sleep_ms(20)
+            self.ok = True
+        except OSError as e:
+            print("[HTU21] begin error:", e)
+            self.ok = False
+        return self.ok
 
-def indice(bg, outpdf, head_text, tittext, addresstext, lefttext, righttext, r1):
-    global savefolder
-    pages = PdfReader(bg, decompress=False).pages
-    pages = [pagexobj(pages[0])]
-    canvas = Canvas(outpdf)
-    canvas.setPageSize(landscape(A4))
-    page_width, page_height = landscape(A4)
+    def _read(self, cmd, delay_ms):
+        self.i2c.writeto(self.addr, bytes([cmd]))
+        time.sleep_ms(delay_ms)
+        d = self.i2c.readfrom(self.addr, 3)
+        raw = (d[0] << 8) | d[1]
+        raw &= 0xFFFC
+        return raw
 
-    canvas.doForm(makerl(canvas, pages[0]))
+    def read_temperature(self):
+        if not self.ok:
+            return None
+        try:
+            raw = self._read(self.CMD_TEMP, 60)
+            t   = -46.85 + (175.72 * raw / 65536.0)
+            return t if -40 < t < 125 else None
+        except OSError as e:
+            print("[HTU21] temp error:", e)
+            return None
 
-    styles = getSampleStyleSheet()
-    normal = styles["Normal"]
-    normal.alignment = TA_JUSTIFY
-    normal.fontName = "Helvetica"
-    normal.fontSize = 11
-    normal.textColor = "#333333"
+    def read_humidity(self):
+        if not self.ok:
+            return None
+        try:
+            raw = self._read(self.CMD_HUM, 20)
+            h   = -6.0 + (125.0 * raw / 65536.0)
+            return max(0.0, min(100.0, h))
+        except OSError as e:
+            print("[HTU21] hum error:", e)
+            return None
 
-    header = styles["Heading1"]
-    header.alignment = TA_RIGHT
-    header.fontName = "Helvetica"
-    header.fontSize = 15
-    header.textColor = "#ffffff"
+# ============================================================
+#  DRIVER BMP180
+# ============================================================
+class BMP180:
+    REG_CALIB = 0xAA
+    REG_CTRL  = 0xF4
+    REG_DATA  = 0xF6
+    CMD_TEMP  = 0x2E
+    CMD_PRES  = 0x34
+    OSS       = 0
 
-    title = styles["Title"]
-    title.alignment = TA_CENTER
-    title.fontName = "Helvetica"
-    title.fontSize = 18
-    title.textColor = "#333333"
+    def __init__(self, i2c, addr=BMP180_ADDR):
+        self.i2c  = i2c
+        self.addr = addr
+        self.cal  = None
+        self.B5   = None
+        self.ok   = False
 
-    address = styles["Heading2"]
-    address.alignment = TA_CENTER
-    address.fontName = "Helvetica"
-    address.fontSize = 9
-    address.textColor = "#333333"
+    def begin(self):
+        try:
+            chip_id = self.i2c.readfrom_mem(self.addr, 0xD0, 1)[0]
+            if chip_id != 0x55:
+                print("[BMP180] unexpected chip_id:", hex(chip_id))
+            buf = self.i2c.readfrom_mem(self.addr, self.REG_CALIB, 22)
+            self._parse_cal(buf)
+            self.ok = True
+        except OSError as e:
+            print("[BMP180]", hex(self.addr), "begin error:", e)
+            self.ok = False
+        return self.ok
 
-    footer = styles["Heading3"]
-    footer.alignment = TA_CENTER
-    footer.fontName = "Helvetica"
-    footer.fontSize = 9
-    footer.textColor = "#333333"
-
-    A0 = Paragraph(head_text, header)
-    B0 = Paragraph('', normal)
-    C0 = Paragraph('', normal)
-    D0 = Paragraph('', normal)
-
-    A1 = Paragraph('INDEX', title)
-    B1 = Paragraph('', normal)
-    C1 = Paragraph('', normal)
-    D1 = Paragraph('', normal)
-
-    A2 = Paragraph(lefttext, normal)
-    B2 = Paragraph('', normal)
-    C2 = Paragraph(righttext, normal)
-    D2 = Paragraph('', normal)
-
-    A3 = Paragraph(addresstext, footer)
-    B3 = Paragraph('', normal)
-    C3 = Paragraph('', normal)
-    D3 = Paragraph('', normal)
-
-    dati = [
-        (A0, B0, C0, D0),
-        (A1, B1, C1, D1),
-        (A2, B2, C2, D2),
-        (A3, B3, C3, D3)
-    ]
-    col_width = (page_width - 20) / 4
-
-    tbl = Table(dati, colWidths=(col_width, col_width, col_width, col_width),
-                rowHeights=(11.66*mm, 23.37*mm, float(r1)*mm, 15.50*mm))
-
-    tbl.setStyle(TableStyle([
-        ('SPAN', (0, 0), (3, 0)),
-        ('TOPPADDING', (0, 0), (3, 0), 4*mm),
-        ('VALIGN', (0, 0), (3, 0), 'MIDDLE'),
-
-        ('SPAN', (0, 1), (3, 1)),
-        ('VALIGN', (0, 1), (3, 1), 'MIDDLE'),
-
-        ('SPAN', (0, 2), (1, 2)),
-        ('ALIGN', (0, 2), (1, 2), 'LEFT'),
-        ('VALIGN', (0, 2), (1, 2), 'TOP'),
-        ('TOPPADDING', (0, 2), (1, 2), 0*mm),
-        ('LEFTPADDING', (0, 2), (1, 2), 2*mm),
-        ('RIGHTPADDING', (0, 2), (1, 2), 2*mm),
-
-        ('SPAN', (2, 2), (3, 2)),
-        ('ALIGN', (2, 2), (3, 2), 'LEFT'),
-        ('VALIGN', (2, 2), (3, 2), 'TOP'),
-        ('TOPPADDING', (2, 2), (3, 2), 0*mm),
-        ('LEFTPADDING', (2, 2), (3, 2), 2*mm),
-        ('RIGHTPADDING', (2, 2), (3, 2), 2*mm),
-
-        ('SPAN', (0, 3), (3, 3)),
-        ('VALIGN', (0, 3), (3, 3), 'TOP'),
-        ('TOPPADDING', (0, 3), (3, 3), 3*mm),
-
-        ('BACKGROUND', (0, 0), (-1, -1), 'transparent'),
-    ]))
-
-    tbl.wrapOn(canvas, page_width - 2*15*mm, page_height - 2*15*mm)
-    tbl.drawOn(canvas, 8*mm, -84*mm)
-    canvas.showPage()
-    canvas.save()
-
-
-def paginate():
-    global language, savefolder, finalfilenamepages, indexfiles, finalfilename
-    try:
-        vuota_h_path = os.path.join(savefolder, "vuota_h.pdf")
-        if not os.path.exists(vuota_h_path):
-            write_log(f"ATTENZIONE: Il file {vuota_h_path} non esiste. Operazione interrotta.")
-            return
-
-        menu = indexfiles.strip().split('\n')
-        merger = PyPDF2.PdfMerger()
-        numpage = 1
-        numpagei = 1
-        addresst = ''
-
-        # Costruzione colonne indice
-        sxcolhtml = ''
-        dxcolhtml = ''
-        changecol = 38
-        cr = 0
-
-        for line in menu:
-            ind = line.split(';')
-            bookmarkname = ind[0]
-            fname = os.path.join(savefolder, ind[1])
-            txtstyle = ind[2]
-            if not os.path.exists(fname):
-                write_log(f"ATTENZIONE: Il file {fname} non esiste. Operazione interrotta.")
-                return
-            x = PdfReader(fname)
-            totpagesi = len(x.pages)
-            if cr <= changecol and txtstyle != 'H':
-                if txtstyle == 'N':
-                    sxcolhtml += "<font size=10><b>%03d</b></font>  ·  <font size=10>%s</font><br/>" % (numpagei, bookmarkname)
-                    cr += 1
-                elif txtstyle == 'B':
-                    sxcolhtml += "<font size=10><b>%03d</b></font>  ·  <font size=10><b>%s</b></font><br/>" % (numpagei, bookmarkname)
-                    cr += 1
-            else:
-                if txtstyle != 'H':
-                    if txtstyle == 'N':
-                        dxcolhtml += "<font size=10><b>%03d</b></font>  ·  <font size=10>%s</font><br/>" % (numpagei, bookmarkname)
-                        cr += 1
-                    elif txtstyle == 'B':
-                        dxcolhtml += "<font size=10><b>%03d</b></font>  ·  <font size=10><b>%s</b></font><br/>" % (numpagei, bookmarkname)
-                        cr += 1
-            numpagei += totpagesi
-
-        # Crea pagina indice
-        write_log("Inizio generazione indice...")
-        indice(os.path.join(savefolder, "vuota_h.pdf"),
-               os.path.join(savefolder, "index.pdf"),
-               '', '<b>INDEX</b>', addresst, sxcolhtml, dxcolhtml, 252.47)
-        write_log("Indice generato.")
-
-        # Merge PDF
-        for line in menu:
-            ind = line.split(';')
-            fname = os.path.join(savefolder, ind[1])
-            bookmarkname = ind[0]
-            x = PdfReader(fname)
-            totpages = len(x.pages)
-            merger.merge(position=numpage, fileobj=open(fname, 'rb'), outline_item=bookmarkname)
-            numpage += totpages
-
-        merger.write(open(os.path.join(savefolder, finalfilename), 'wb'))
-
-        # Numerazione pagine
-        width, height = 297, 210
-        firstpage = 1
-        lastpage = numpage
-        pgn = 1
-        excl = [1, lastpage, lastpage - 1]
-        pages = PdfReader(os.path.join(savefolder, finalfilename), decompress=False).pages
-        pages = [pagexobj(x) for x in pages[firstpage-1:lastpage]]
-        canvas = Canvas(os.path.join(savefolder, finalfilenamepages))
-
-        for page in pages:
-            canvas.setPageSize((width*mm, height*mm))
-            canvas.doForm(makerl(canvas, page))
-            styles = getSampleStyleSheet()
-            snp = styles["Normal"]
-            snp.alignment = TA_LEFT
-            snp.fontName = "Helvetica"
-            snp.fontSize = 11
-            snp.textColor = "#333333"
-            np = "<font size=11>%s</font>" % pgn
-            A0 = Paragraph(np, snp)
-            B0 = Paragraph('', snp)
-            dati = [(A0, B0)]
-            tabl = Table(dati, colWidths=(10.00, 10.00*mm), rowHeights=(10.00*mm))
-            tabl.setStyle(TableStyle([
-                ('SPAN', (0, 0), (1, 0)),
-                ('TOPPADDING', (0, 0), (1, 0), 0*mm),
-                ('VALIGN', (0, 0), (1, 0), 'BOTTOM'),
-                ('ALIGN', (0, 0), (1, 0), 'CENTER'),
-                ('BACKGROUND', (0, 0), (1, 0), 'transparent'),
-            ]))
-            if pgn not in excl:
-                tabl.wrapOn(canvas, 20.0*mm, 10.0*mm)
-                tabl.drawOn(canvas, 281.0*mm, 3.0*mm)
-            canvas.showPage()
-            pgn += 1
-
-        canvas.save()
-        compress_pdf_final(os.path.join(savefolder, finalfilenamepages))
-        write_log("PDF creato con successo!")
-        zip_xls_folder()
-        delete_finalfilenamepages()
-        root.bell()
-
-    except Exception as e:
-        write_log(f"Errore paginate: {repr(e)}")
-
-
-# --- FUNZIONI CORE GUI ---
-
-def paginate_with_params():
-    global priceslevel, vo, fr, ph, language, brand, template, pricetemplate, distlink, savefolder, indexfiles, finalname, finalfilename, finalfilenamepages, phases
-    priceslevel = priceslevel_entry.get()
-    vo = v_entry.get()
-    fr = f_entry.get()
-    ph = ph_entry.get()
-    language = language_entry.get()
-    distlink = f"https://quote.visa.it/{language}/price-list-distiller&action=bypass"
-    brand = brand_entry.get()
-    template = template_entry.get()
-    pricetemplate = pricetemplate_entry.get()
-    savefolder = folder_entry.get()
-    phases = phases_entry.get()
-    finalname = name_entry.get()
-    finalfilename = finalname + ".pdf"
-    finalfilenamepages = finalname + "_pages.pdf"
-
-    if solo_impaginazione_var.get():
-        # Salta generazione file, vai direttamente all'impaginazione
-        copy_vuota_to_index()
-        if not indexfiles.strip():
-            write_log("Errore: Caricare file index.txt per la generazione PDF!")
-            return
-        root.after(0, paginate)
-        return
-
-    if not solo_excel_var.get():
-        copy_vuota_to_index()
-        if not indexfiles.strip():
-            write_log("Errore: Caricare file index.txt per la generazione PDF!")
-            return
-
-    ensure_xls_folder()
-    threading.Thread(target=quote_generate_thread).start()
-
-def quote_generate_thread():
-    global language
-    try:
-        login()
-        for item in pricelist_array:
-            generate(item, extraparams, language)
-        if solo_excel_var.get():
-            # Solo Excel: zippa e fine, senza impaginazione PDF
-            zip_xls_folder()
-            write_log("PROCESSO COMPLETATO (Solo Excel).")
-            root.bell()
-        else:
-            root.after(0, paginate)
-    except Exception as e:
-        write_log(f"Errore nel thread: {e}")
-
-
-# --- FUNZIONI UTILITY ---
-
-def select_folder():
-    f = filedialog.askdirectory()
-    if f:
-        folder_entry.delete(0, tk.END)
-        folder_entry.insert(0, f)
-
-def load_indexfiles_from_file():
-    global indexfiles, indexfile_path
-    try:
-        file_path = filedialog.askopenfilename(
-            title="Seleziona il file index.txt",
-            filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")]
+    def _parse_cal(self, buf):
+        def s16(h, l): v = (h << 8) | l; return v - 65536 if v & 0x8000 else v
+        def u16(h, l): return (h << 8) | l
+        self.cal = (
+            s16(buf[0],buf[1]),   s16(buf[2],buf[3]),   s16(buf[4],buf[5]),
+            u16(buf[6],buf[7]),   u16(buf[8],buf[9]),   u16(buf[10],buf[11]),
+            s16(buf[12],buf[13]), s16(buf[14],buf[15]), s16(buf[16],buf[17]),
+            s16(buf[18],buf[19]), s16(buf[20],buf[21]),
         )
-        if file_path:
-            with open(file_path, "r", encoding="utf-8") as f:
-                indexfiles = f.read()
-            indexfile_path = file_path
-            indexfile_label.config(text=os.path.basename(file_path))
-            write_log(f"File index caricato: {file_path}")
-    except Exception as e:
-        write_log(f"Errore caricamento file index: {e}")
 
-def ensure_xls_folder():
-    global savefolder
-    xls_path = os.path.join(savefolder, "xls")
+    def _read_ut(self):
+        self.i2c.writeto_mem(self.addr, self.REG_CTRL, bytes([self.CMD_TEMP]))
+        time.sleep_ms(6)
+        d = self.i2c.readfrom_mem(self.addr, self.REG_DATA, 2)
+        return (d[0] << 8) | d[1]
+
+    def _read_up(self):
+        cmd = self.CMD_PRES | (self.OSS << 6)
+        self.i2c.writeto_mem(self.addr, self.REG_CTRL, bytes([cmd]))
+        time.sleep_ms(6)
+        d = self.i2c.readfrom_mem(self.addr, self.REG_DATA, 3)
+        return ((d[0] << 16) | (d[1] << 8) | d[2]) >> (8 - self.OSS)
+
+    def read_both(self):
+        if not self.ok or not self.cal:
+            return None, None
+        try:
+            AC1,AC2,AC3,AC4,AC5,AC6,B1,B2,MB,MC,MD = self.cal
+            UT = self._read_ut()
+            X1 = ((UT - AC6) * AC5) >> 15
+            X2 = (MC << 11) // (X1 + MD)
+            self.B5 = X1 + X2
+            T  = (self.B5 + 8) >> 4
+            temp = T / 10.0
+            UP = self._read_up()
+            B6 = self.B5 - 4000
+            X1 = (B2 * ((B6 * B6) >> 12)) >> 11
+            X2 = (AC2 * B6) >> 11
+            X3 = X1 + X2
+            B3 = (((AC1 * 4 + X3) << self.OSS) + 2) >> 2
+            X1 = (AC3 * B6) >> 13
+            X2 = (B1 * ((B6 * B6) >> 12)) >> 16
+            X3 = ((X1 + X2) + 2) >> 2
+            B4 = (AC4 * (X3 + 32768)) >> 15
+            if B4 == 0:
+                return temp, None
+            B7 = (UP - B3) * (50000 >> self.OSS)
+            p  = (B7 * 2) // B4 if B7 < 0x80000000 else (B7 // B4) * 2
+            X1 = (p >> 8) * (p >> 8)
+            X1 = (X1 * 3038) >> 16
+            X2 = (-7357 * p) >> 16
+            p  = p + ((X1 + X2 + 3791) >> 4)
+            press = p / 100.0
+            if not (-40 < temp < 85): temp = None
+            if press is not None and not (300 < press < 1200): press = None
+            return temp, press
+        except (OSError, ZeroDivisionError, TypeError) as e:
+            print("[BMP180]", hex(self.addr), "read error:", e)
+            return None, None
+
+# ============================================================
+#  WIFI
+#  Fix principali rispetto alla versione precedente:
+#  1. feed_wdt() dentro il loop di attesa connessione
+#  2. IP statico reimpostato ad ogni tentativo (si perde dopo disconnect)
+#  3. WIFI_TIMEOUT_S ridotto a 20s, WDT alzato a 90s
+#     → 3 retry * 20s = 60s < WDT 90s (non scatta mai durante WiFi)
+#  4. _wlan.active(False/True) per reset hardware stack WiFi
+#     in caso di blocco prolungato
+# ============================================================
+_wlan = None
+
+def connect_wifi():
+    global _wlan
+    if _wlan is None:
+        _wlan = network.WLAN(network.STA_IF)
+
+    # Reset stack completo una volta sola all'inizio —
+    # evita stati residui da cicli precedenti o da deep sleep
+    _wlan.active(False)
+    time.sleep_ms(300)
+    _wlan.active(True)
+    _wlan.config(txpower=20)
+    time.sleep_ms(300)
+
+    for ssid, pw, mode in NETWORKS:
+        use_static = (mode.upper() == "IP")
+
+        for attempt in range(WIFI_RETRY_N):
+            feed_wdt()
+            print(f"[WiFi] {ssid} tentativo {attempt+1}/{WIFI_RETRY_N} ({'IP statico' if use_static else 'DHCP'})")
+            try:
+                _wlan.disconnect()
+                time.sleep_ms(300)
+
+                if use_static:
+                    # IP ruotato ad ogni tentativo — aumenta probabilità
+                    # di evitare conflitti ARP con lease residui sul router
+                    ip = STATIC_IPS[attempt % len(STATIC_IPS)]
+                    print(f"[WiFi] IP statico: {ip}")
+                    _wlan.ifconfig((ip, STATIC_MASK, STATIC_GW, STATIC_DNS1))
+                else:
+                    # Forza DHCP esplicitamente — MicroPython persiste
+                    # l'ultimo ifconfig in NVS flash e riusa l'IP statico
+                    # precedente se non viene azzerato esplicitamente
+                    _wlan.ifconfig('dhcp')
+
+                _wlan.connect(ssid, pw)
+                t0 = time.time()
+                while not _wlan.isconnected():
+                    if time.time() - t0 > WIFI_TIMEOUT_S:
+                        print(f"[WiFi] timeout dopo {WIFI_TIMEOUT_S}s")
+                        break
+                    feed_wdt()  # <-- critico: evita WDT durante attesa
+                    time.sleep_ms(300)
+
+                if _wlan.isconnected():
+                    ip, mask, gw, dns = _wlan.ifconfig()
+                    print(f"[WiFi] OK {'IP statico' if use_static else 'DHCP'} — IP:{ip} GW:{gw}")
+                    return True
+
+            except Exception as e:
+                print(f"[WiFi] errore tentativo {attempt+1}:", e)
+
+            # Pausa breve tra retry con feed WDT
+            feed_wdt()
+            time.sleep_ms(500)
+
+    # Tutti i tentativi falliti — reset hardware stack WiFi
+    # per evitare stato corrotto al prossimo wake
+    print("[WiFi] FAIL — reset stack WiFi")
     try:
-        if not os.path.exists(xls_path):
-            os.makedirs(xls_path)
-            write_log(f"Cartella 'xls' creata in: {xls_path}")
-        else:
-            for filename in os.listdir(xls_path):
-                file_path = os.path.join(xls_path, filename)
-                try:
-                    if os.path.isfile(file_path) or os.path.islink(file_path):
-                        os.unlink(file_path)
-                    elif os.path.isdir(file_path):
-                        import shutil as _shutil
-                        _shutil.rmtree(file_path)
-                except Exception as e:
-                    write_log(f"Errore cancellazione {file_path}: {e}")
-            write_log(f"Cartella 'xls' svuotata: {xls_path}")
-    except Exception as e:
-        write_log(f"Errore gestione cartella 'xls': {e}")
+        _wlan.active(False)
+        time.sleep_ms(200)
+        _wlan.active(True)
+    except Exception:
+        pass
 
-def zip_xls_folder():
-    global savefolder, finalname
-    xls_path = os.path.join(savefolder, "xls")
-    zip_path = os.path.join(savefolder, finalname + '.zip')
-    if not os.path.exists(xls_path):
-        write_log("Cartella 'xls' non trovata.")
+    return False
+
+def ensure_wifi():
+    if _wlan and _wlan.isconnected():
+        return True
+    print("[WiFi] riconnessione...")
+    return connect_wifi()
+
+def disconnect_wifi():
+    """Disconnessione pulita con notifica all'AP.
+    Libera il MAC sul router prima del deep sleep evitando
+    che rimanga appeso tra un ciclo e il successivo.
+    """
+    global _wlan
+    if _wlan is None or not _wlan.isconnected():
+        if _wlan:
+            _wlan.active(False)
         return
     try:
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            for root_dir, dirs, files in os.walk(xls_path):
-                for file in files:
-                    if file.lower().endswith('.xls'):
-                        file_path = os.path.join(root_dir, file)
-                        arcname = os.path.relpath(file_path, xls_path)
-                        zipf.write(file_path, arcname)
-        write_log(f"Archivio ZIP creato: {zip_path}")
+        print("[WiFi] disconnessione pulita...")
+        _wlan.disconnect()
+        time.sleep_ms(200)
+        _wlan.active(False)
+        print("[WiFi] disconnesso")
     except Exception as e:
-        write_log(f"Errore creazione ZIP: {e}")
+        print("[WiFi] errore disconnessione:", e)
 
-def copy_vuota_to_index():
-    global savefolder
+# ============================================================
+#  PAYLOAD HELPERS
+# ============================================================
+def lux_to_payload(lux):
+    if lux is None or lux <= 0:
+        return 0
+    v = int(math.log10(lux + 1.0) * 200.0)
+    return max(0, min(999, v))
+
+def read_soil(adc):
+    samples = []
+    for _ in range(SOIL_SAMPLES):
+        try:
+            v = adc.read()
+            if 0 <= v <= 4095:
+                samples.append(v)
+        except Exception:
+            pass
+        time.sleep_ms(SOIL_DELAY_MS)
+    if not samples:
+        return None
+    avg = sum(samples) // len(samples)
+    if avg > SOIL_FLOAT:
+        return None
+    if SOIL_DRY == SOIL_WET:
+        return None
+    pct = (SOIL_DRY - avg) * 100.0 / (SOIL_DRY - SOIL_WET)
+    return int(max(0.0, min(100.0, pct)))
+
+def read_dht(sensor):
+    for attempt in range(DHT_RETRIES):
+        try:
+            sensor.measure()
+            t = sensor.temperature()
+            u = sensor.humidity()
+            if -40 < t < 80 and 0 <= u <= 100:
+                return t, u
+            print(f"[DHT22] fuori range T={t} U={u}")
+        except Exception as e:
+            print(f"[DHT22] tentativo {attempt+1} errore: {e}")
+        if attempt < DHT_RETRIES - 1:
+            time.sleep_ms(DHT_RETRY_MS)
+    return None, None
+
+def build_payload(t1, t2, u1, u2, soil, lu, pr1, pr2):
+    def ci(v): return int(v * 10) if v is not None else 0
+    def cp(v): return int(v)      if v is not None else 0
+    def cl(v, lo, hi): return max(lo, min(hi, v))
+    return "{:03d}{:03d}{:03d}{:03d}{:03d}{:03d}{:04d}{:04d}".format(
+        cl(ci(t1),  0, 999), cl(ci(t2),  0, 999),
+        cl(ci(u1),  0, 999), cl(ci(u2),  0, 999),
+        cl(ci(soil),0, 999), cl(lu,       0, 999),
+        cl(cp(pr1), 0,9999), cl(cp(pr2),  0,9999),
+    )
+
+def send_payload(payload):
+    url = SERVER_URL + payload
     try:
-        src = os.path.join(savefolder, "vuota_h.pdf")
-        dst = os.path.join(savefolder, "index.pdf")
-        shutil.copyfile(src, dst)
-        write_log("Copiato vuota_h.pdf su index.pdf")
+        r  = requests.get(url, timeout=HTTP_TIMEOUT)
+        ok = (r.status_code == 200)
+        print(f"[HTTP] {r.status_code} — {'OK' if ok else 'FAIL'} — {r.text[:80]}")
+        r.close()
+        return ok
     except Exception as e:
-        write_log(f"Errore copia vuota_h.pdf: {e}")
+        print("[HTTP] errore:", e)
+        return False
 
-def compress_pdf_final(input_file):
-    global finalfilename, savefolder
+# ============================================================
+#  INIT HARDWARE
+# ============================================================
+print(f"\n=== CORTIGOCAMPATI BOOT ({'COLD' if COLD_BOOT else 'WAKE'}) ===")
+print(f"[CPU] {machine.freq()//1000000} MHz")
+
+# WDT — inizializzato PRIMA di qualsiasi operazione lunga
+wdt = None
+if WDT_ENABLE:
     try:
-        compressed_file = os.path.join(savefolder, finalfilename)
-        args = [
-            "-q",
-            "-dBATCH",
-            "-dNOPAUSE",
-            "-sDEVICE=pdfwrite",
-            "-dCompatibilityLevel=1.4",
-            "-dPDFSETTINGS=/default",
-            "-dColorImageDownsampleType=/Bicubic",
-            "-dColorImageResolution=150",
-            "-dGrayImageDownsampleType=/Bicubic",
-            "-dGrayImageResolution=150",
-            "-dMonoImageDownsampleType=/Subsample",
-            "-dMonoImageResolution=150",
-            "-dJPEGQ=85",
-            "-sOutputFile=" + compressed_file,
-            input_file
-        ]
-        ghostscript.Ghostscript(*args)
-        write_log(f"Compressione completata: {compressed_file}")
-        filenamepdf = "/fileserver/109_Documenti_Commerciali/"+finalname+'.pdf'
-        tokenpdf = make_token(filenamepdf)
-        urlpdf = "https://www.visa.it"+filenamepdf+"?token="+tokenpdf
-        write_log(f"File URL: {urlpdf}")
-        filenamezip = "/fileserver/109_Documenti_Commerciali/"+finalname+'.zip'
-        tokenzip = make_token(filenamezip)
-        urlzip = "https://www.visa.it"+filenamezip+"?token="+tokenzip
-        write_log(f"File URL: {urlzip}")
-
-
+        wdt = WDT(timeout=WDT_TIMEOUT)
+        print(f"[WDT] abilitato ({WDT_TIMEOUT//1000}s)")
     except Exception as e:
-        write_log(f"Errore durante la compressione: {e}")
+        print("[WDT] non disponibile:", e)
 
-def delete_finalfilenamepages():
-    global finalfilenamepages, savefolder
-    filepath = os.path.join(savefolder, finalfilenamepages)
-    try:
-        if os.path.exists(filepath):
-            os.remove(filepath)
-            write_log(f"File temporaneo cancellato: {filepath}")
-        else:
-            write_log(f"File non trovato: {filepath}")
-    except Exception as e:
-        write_log(f"Errore cancellazione {filepath}: {e}")
+def feed_wdt():
+    if wdt:
+        wdt.feed()
 
+# I2C buses
+i2c0 = I2C(0, scl=Pin(I2C0_SCL), sda=Pin(I2C0_SDA), freq=100000)
+i2c1 = I2C(1, scl=Pin(I2C1_SCL), sda=Pin(I2C1_SDA), freq=100000)
 
-# --- INTERFACCIA GRAFICA ---
+if COLD_BOOT:
+    for idx, bus in [(0, i2c0), (1, i2c1)]:
+        devs = bus.scan()
+        print(f"[I2C{idx}] scan: {[hex(d) for d in devs]}")
 
-root = tk.Tk()
-root.title("Visa Pricelist Generator 2026")
-root.geometry("800x750")
+bh   = BH1750(i2c0, BH1750_ADDR)
+htu  = HTU21 (i2c1, HTU21_ADDR)
+bmp2 = BMP180(i2c0, BMP180_ADDR)
+bmp1 = BMP180(i2c1, BMP180_ADDR)
 
-fields = [
-    ("Prices Level:", "priceslevel_entry", default_priceslevel),
-    ("V (Voltage):", "v_entry", default_vo),
-    ("F (Frequency):", "f_entry", default_fr),
-    ("P (Phases):", "ph_entry", default_ph_val),
-    ("Phases string:", "phases_entry", default_ph),
-    ("Language:", "language_entry", default_language),
-    ("Brand:", "brand_entry", default_brand),
-    ("Template:", "template_entry", default_template),
-    ("Price Template:", "pricetemplate_entry", default_pricetemplate),
-    ("File name:", "name_entry", default_name),
-]
+print("[BH1750]", "OK" if bh.begin()   else "FAIL")
+print("[HTU21 ]", "OK" if htu.begin()  else "FAIL")
+print("[BMP2  ]", "OK" if bmp2.begin() else "FAIL", "(I2C0 21/22)")
+print("[BMP1  ]", "OK" if bmp1.begin() else "FAIL", "(I2C1 18/19)")
 
-entries = {}
-for txt, var_name, dval in fields:
-    tk.Label(root, text=txt).pack()
-    ent = tk.Entry(root)
-    ent.insert(0, dval)
-    ent.pack()
-    entries[var_name] = ent
+dht22 = dht.DHT22(Pin(DHT_PIN))
+if COLD_BOOT:
+    print("[DHT22] cold boot — warm-up 2s...")
+    time.sleep_ms(2000)
 
-priceslevel_entry = entries["priceslevel_entry"]
-v_entry           = entries["v_entry"]
-f_entry           = entries["f_entry"]
-ph_entry          = entries["ph_entry"]
-phases_entry      = entries["phases_entry"]
-language_entry    = entries["language_entry"]
-brand_entry       = entries["brand_entry"]
-template_entry    = entries["template_entry"]
-pricetemplate_entry = entries["pricetemplate_entry"]
-name_entry        = entries["name_entry"]
+adc = ADC(Pin(SOIL_PIN))
+adc.atten(ADC.ATTN_11DB)
+adc.width(ADC.WIDTH_12BIT)
 
-tk.Label(root, text="Default folder:").pack()
-f_frame = tk.Frame(root)
-f_frame.pack()
-folder_entry = tk.Entry(f_frame, width=50)
-folder_entry.insert(0, default_folder)
-folder_entry.pack(side=tk.LEFT)
-tk.Button(f_frame, text="...", command=select_folder).pack(side=tk.LEFT)
+feed_wdt()
+connect_wifi()
+feed_wdt()
 
-tk.Button(root, text="Carica Index.txt", command=load_indexfiles_from_file).pack(pady=5)
-indexfile_label = tk.Label(root, text="Nessun file caricato", fg="blue")
-indexfile_label.pack()
+# ============================================================
+#  MISURA + INVIO
+# ============================================================
+try:
+    feed_wdt()
 
-# Flag SOLO EXCEL
-solo_excel_var = tk.BooleanVar(value=False)
-tk.Checkbutton(root, text="SOLO EXCEL (Salva tempo, no PDF)", variable=solo_excel_var,
-               font=("Arial", 11, "bold"), fg="red").pack(pady=(10, 2))
+    t1, u1 = read_dht(dht22)
+    feed_wdt()
 
-# Flag SOLO IMPAGINAZIONE
-solo_impaginazione_var = tk.BooleanVar(value=False)
-tk.Checkbutton(root, text="SOLO IMPAGINAZIONE PDF (Usa file già generati)", variable=solo_impaginazione_var,
-               font=("Arial", 11, "bold"), fg="blue").pack(pady=(2, 10))
+    t2 = htu.read_temperature()
+    u2 = htu.read_humidity()
 
-tk.Button(root, text="GENERA ORA", font=("Arial", 14, "bold"), bg="#4CAF50", fg="white",
-          command=paginate_with_params).pack(pady=10)
+    lux    = bh.read_lux()
+    lu_pay = lux_to_payload(lux)
+    feed_wdt()
 
-# Log
-log_frame = tk.Frame(root)
-log_frame.pack(pady=10, fill=tk.BOTH, expand=True)
-log_text = tk.Text(log_frame, height=15, state='disabled')
-log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-sb = tk.Scrollbar(log_frame, command=log_text.yview)
-sb.pack(side=tk.RIGHT, fill=tk.Y)
-log_text.config(yscrollcommand=sb.set)
+    _, pr1 = bmp1.read_both()
+    _, pr2 = bmp2.read_both()
+    feed_wdt()
 
-root.mainloop()
+    soil = read_soil(adc)
+
+    print(f"[T1={t1}C U1={u1}%] [T2={t2}C U2={u2}%] "
+          f"[Soil={soil}%] [Lux={lux}->{lu_pay}] "
+          f"[PR1={pr1}hPa] [PR2={pr2}hPa]")
+
+    payload = build_payload(t1, t2, u1, u2, soil, lu_pay, pr1, pr2)
+    print("[Payload]", payload, f"({len(payload)} chr)")
+    feed_wdt()
+
+    if ensure_wifi():
+        # Retry invio: reti con NAT o DNS lenti possono fallire al primo tentativo
+        sent = False
+        for send_attempt in range(2):
+            if send_payload(payload):
+                sent = True
+                break
+            print(f"[HTTP] retry {send_attempt+1}...")
+            feed_wdt()
+            time.sleep_ms(2000)
+        if not sent:
+            print("[HTTP] invio fallito dopo retry")
+    else:
+        print("[Main] WiFi non disponibile, payload saltato")
+
+    feed_wdt()
+    disconnect_wifi()  # libera MAC sul router prima del deep sleep
+    feed_wdt()
+
+except MemoryError as e:
+    print("[Main] MemoryError:", e, "— reset via WDT")
+    time.sleep(WDT_TIMEOUT // 1000 + 1)
+
+except Exception as e:
+    print("[Main] errore:", e)
+
+# ============================================================
+#  DEEP SLEEP
+# ============================================================
+print(f"[Sleep] deep sleep {SLEEP_S}s...")
+machine.deepsleep(SLEEP_S * 1000)
