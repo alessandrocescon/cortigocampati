@@ -51,9 +51,9 @@ WDT_TIMEOUT = 90000   # ms — era 60000, troppo poco per 3 retry da 30s
 #  WIFI
 # ============================================================
 NETWORKS = [
-    ("tp_campagna",    "Gioelenicolo1",  "IP"),
-    ("ACWIFI",         "12345678",       "DHCP"),
-    ("acesconwifi24",  "LoveEyefly2016", "DHCP"),
+    ("tp_campagna",    "***",  "IP"),
+    ("ACWIFI",         "***",       "DHCP"),
+    ("acesconwifi24",  "***", "DHCP"),
 ]
 WIFI_TIMEOUT_S = 15   # era 30 — ridotto, 3 retry * 20s = 60s < WDT 90s
 WIFI_RETRY_N   = 2
